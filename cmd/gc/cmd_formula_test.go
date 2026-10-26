@@ -1100,4 +1100,25 @@ title = "Do work"
 		rootID := cook(t, append([]string{"graph-work", "--attach", source.ID, "--json"}, metaArgs...)...)
 		assertRootMeta(t, store, rootID)
 	})
+
+	t.Run("attach rejects invalid meta before creating beads", func(t *testing.T) {
+		store, source := setupCity(t, "plain-work", v1Formula)
+		before, err := store.List(beads.ListQuery{AllowScan: true})
+		if err != nil {
+			t.Fatalf("list beads: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		cmd := newFormulaCookCmd(&stdout, &stderr)
+		cmd.SetArgs([]string{"plain-work", "--attach", source.ID, "--meta", "no-equals-sign"})
+		if err := cmd.Execute(); err == nil {
+			t.Fatal("formula cook succeeded with invalid --meta, want error")
+		}
+		after, err := store.List(beads.ListQuery{AllowScan: true})
+		if err != nil {
+			t.Fatalf("list beads: %v", err)
+		}
+		if len(after) != len(before) {
+			t.Fatalf("bead count changed from %d to %d on rejected cook", len(before), len(after))
+		}
+	})
 }
