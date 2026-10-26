@@ -647,6 +647,11 @@ conflicting live workflow from the same source is an error.`,
 
 			cookVars := parseFormulaVars(vars)
 
+			rootMeta, err := parseMetadataArgs(metadata)
+			if err != nil {
+				return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
+			}
+
 			if attach != "" {
 				isGraphFormula, _, err := graphv2.IsGraphV2Formula(args[0], scope.searchPaths)
 				if err != nil {
@@ -725,6 +730,9 @@ conflicting live workflow from the same source is an error.`,
 					if err != nil {
 						return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
 					}
+					if err := setFormulaCookRootMetadata(store, result.RootID, rootMeta); err != nil {
+						return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
+					}
 					if jsonOutput {
 						if err := writeCLIJSONLineOrErr(stdout, stderr, "gc formula cook", formulaCookJSONResult{
 							SchemaVersion:  "1",
@@ -772,6 +780,9 @@ conflicting live workflow from the same source is an error.`,
 				if err != nil {
 					return formulaCommandError(stderr, "gc formula cook: attach", jsonOutput, err)
 				}
+				if err := setFormulaCookRootMetadata(store, result.RootID, rootMeta); err != nil {
+					return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
+				}
 
 				if jsonOutput {
 					if err := writeCLIJSONLineOrErr(stdout, stderr, "gc formula cook", formulaCookJSONResult{
@@ -813,15 +824,8 @@ conflicting live workflow from the same source is an error.`,
 				return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
 			}
 
-			rootMeta, err := parseMetadataArgs(metadata)
-			if err != nil {
+			if err := setFormulaCookRootMetadata(store, result.RootID, rootMeta); err != nil {
 				return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
-			}
-			if len(rootMeta) > 0 {
-				if err := store.SetMetadataBatch(result.RootID, rootMeta); err != nil {
-					err := fmt.Errorf("setting root metadata on %s: %w", result.RootID, err)
-					return formulaCommandError(stderr, "gc formula cook", jsonOutput, err)
-				}
 			}
 
 			if jsonOutput {
@@ -1028,6 +1032,19 @@ func parseMetadataArgs(items []string) (map[string]string, error) {
 		out[key] = value
 	}
 	return out, nil
+}
+
+// setFormulaCookRootMetadata stamps --meta key=value pairs on the cooked root
+// bead. It applies to standalone cooks and both --attach paths (v1 and
+// graph.v2), including idempotent re-cooks that reuse an existing root.
+func setFormulaCookRootMetadata(store beads.Store, rootID string, meta map[string]string) error {
+	if len(meta) == 0 {
+		return nil
+	}
+	if err := store.SetMetadataBatch(rootID, meta); err != nil {
+		return fmt.Errorf("setting root metadata on %s: %w", rootID, err)
+	}
+	return nil
 }
 
 // formulaScope is the resolved rig/city context for a formula invocation.

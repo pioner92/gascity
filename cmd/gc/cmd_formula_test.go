@@ -976,3 +976,128 @@ title = "Do work for {{convoy_id}}"
 		t.Fatalf("WorkflowIDs = %+v, want [%s]", conflictErr.WorkflowIDs, legacyRoot.ID)
 	}
 }
+
+// TestFormulaCookAttachAppliesRootMetadata locks in that --meta key=value
+// pairs land on the cooked root for both standalone and --attach cooks, on
+// both v1 and graph.v2 formulas (issue #7309: attached cooks used to return
+// before the shared metadata write, silently dropping --meta).
+func TestFormulaCookAttachAppliesRootMetadata(t *testing.T) {
+	wantMeta := map[string]string{
+		"work_dir":         "/tmp/cook-repro-worktree",
+		"review_work_bead": "fixture-bead",
+		"base_sha":         "base-abc",
+		"head_sha":         "head-def",
+	}
+	metaArgs := []string{
+		"--meta", "work_dir=/tmp/cook-repro-worktree",
+		"--meta", "review_work_bead=fixture-bead",
+		"--meta", "base_sha=base-abc",
+		"--meta", "head_sha=head-def",
+	}
+
+	setupCity := func(t *testing.T, formulaName, formulaBody string) (beads.Store, beads.Bead) {
+		t.Helper()
+		formulatest.EnableV2ForTest(t)
+		t.Setenv("GC_HOME", t.TempDir())
+		t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+		t.Setenv("GC_SESSION", "fake")
+		t.Setenv("GC_BEADS", "file")
+		t.Setenv("GC_DOLT", "skip")
+
+		cityDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(withBuiltinProviderAliasesTOMLForTest(`
+[workspace]
+name = "my-city"
+provider = "claude"
+
+[daemon]
+formula_v2 = true
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
+			t.Fatalf("write city.toml: %v", err)
+		}
+		formulaDir := filepath.Join(cityDir, "formulas")
+		if err := os.MkdirAll(formulaDir, 0o755); err != nil {
+			t.Fatalf("mkdir formulas: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(formulaDir, formulaName+".formula.toml"), []byte(formulaBody), 0o644); err != nil {
+			t.Fatalf("write formula: %v", err)
+		}
+		t.Chdir(cityDir)
+		store, err := openStoreAtForCity(cityDir, cityDir)
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		source, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+		if err != nil {
+			t.Fatalf("create source: %v", err)
+		}
+		return store, source
+	}
+
+	cook := func(t *testing.T, args ...string) string {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		cmd := newFormulaCookCmd(&stdout, &stderr)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("formula cook %v: %v\nstdout=%s\nstderr=%s", args, err, stdout.String(), stderr.String())
+		}
+		var result formulaCookJSONResult
+		if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+			t.Fatalf("decode cook result: %v\nstdout=%s", err, stdout.String())
+		}
+		return result.RootID
+	}
+
+	assertRootMeta := func(t *testing.T, store beads.Store, rootID string) {
+		t.Helper()
+		root, err := store.Get(rootID)
+		if err != nil {
+			t.Fatalf("get root %s: %v", rootID, err)
+		}
+		for k, want := range wantMeta {
+			if got := root.Metadata[k]; got != want {
+				t.Errorf("root %s metadata[%q] = %q, want %q (all metadata: %#v)", rootID, k, got, want, root.Metadata)
+			}
+		}
+	}
+
+	v1Formula := `formula = "plain-work"
+
+[[steps]]
+id = "step"
+title = "Do work"
+`
+	graphV2Formula := `formula = "graph-work"
+version = 2
+contract = "graph.v2"
+
+[[steps]]
+id = "step"
+title = "Do work"
+`
+
+	t.Run("v1 standalone", func(t *testing.T) {
+		store, _ := setupCity(t, "plain-work", v1Formula)
+		rootID := cook(t, append([]string{"plain-work", "--json"}, metaArgs...)...)
+		assertRootMeta(t, store, rootID)
+	})
+
+	t.Run("v1 attach", func(t *testing.T) {
+		store, source := setupCity(t, "plain-work", v1Formula)
+		rootID := cook(t, append([]string{"plain-work", "--attach", source.ID, "--json"}, metaArgs...)...)
+		assertRootMeta(t, store, rootID)
+	})
+
+	t.Run("graph.v2 standalone", func(t *testing.T) {
+		store, _ := setupCity(t, "graph-work", graphV2Formula)
+		rootID := cook(t, append([]string{"graph-work", "--json"}, metaArgs...)...)
+		assertRootMeta(t, store, rootID)
+	})
+
+	t.Run("graph.v2 attach", func(t *testing.T) {
+		store, source := setupCity(t, "graph-work", graphV2Formula)
+		rootID := cook(t, append([]string{"graph-work", "--attach", source.ID, "--json"}, metaArgs...)...)
+		assertRootMeta(t, store, rootID)
+	})
+}
