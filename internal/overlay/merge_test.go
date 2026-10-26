@@ -785,3 +785,117 @@ func TestMergeSettingsJSON_NoWrap_LeavesBareEntries(t *testing.T) {
 		t.Errorf("bare entry was wrapped without WithWrapBareHooks: %v", arr[0])
 	}
 }
+
+// ubsBareEntry is the bare PreToolUse hook shape the flywheel/ubs pack ships
+// (gastownhall/gascity#3862). The first projection wraps it into
+// {"matcher":"","hooks":[<entry>]} in the agent's .claude/settings.json; every
+// later reconcile tick re-projects the bare overlay over that wrapped base.
+const ubsBareEntry = `{"type":"command","command":"if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}`
+
+func TestMergeSettingsJSON_WrapBareHooks_BareOverlayMatchesOwnWrappedProjection(t *testing.T) {
+	// Regression for #3862: base already holds the wrapped form of the bare
+	// overlay entry (produced by the previous projection). Re-merging the bare
+	// overlay must replace that entry, not blind-append a second copy.
+	base := `{"hooks":{"PreToolUse":[{"matcher":"","hooks":[` + ubsBareEntry + `]}]}}`
+	over := `{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	arr := preToolUse(t, result)
+	if len(arr) != 1 {
+		t.Fatalf("PreToolUse entries = %d, want 1 (bare overlay must match its own wrapped projection)", len(arr))
+	}
+	entry := arr[0].(map[string]any)
+	if entry["matcher"] != "" {
+		t.Errorf("matcher = %v, want empty string (wrapped Claude form)", entry["matcher"])
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_BareOverlayIdempotentAcrossManyMerges(t *testing.T) {
+	// The #3862 repro: N reconcile ticks each re-project the same bare overlay.
+	// The PreToolUse array must converge to exactly 1 entry, not grow to N.
+	over := []byte(`{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`)
+	merged := []byte(`{}`)
+	for i := 0; i < 25; i++ {
+		var err error
+		merged, err = MergeSettingsJSON(merged, over, WithWrapBareHooks())
+		if err != nil {
+			t.Fatalf("merge iteration %d: %v", i, err)
+		}
+		if got := len(preToolUse(t, merged)); got != 1 {
+			t.Fatalf("PreToolUse entries after %d merges = %d, want 1 (idempotent)", i+1, got)
+		}
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_BareOverlayPreservesCoreHook(t *testing.T) {
+	// The base holds a gc-managed core hook with matcher "" plus the wrapped
+	// ubs projection. The bare overlay must replace only its own entry and
+	// leave the core hook untouched.
+	core := `{"matcher":"","hooks":[{"type":"command","command":"gc hook --inject"}]}`
+	base := `{"hooks":{"PreToolUse":[` + core + `,{"matcher":"","hooks":[` + ubsBareEntry + `]}]}}`
+	over := `{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	arr := preToolUse(t, result)
+	if len(arr) != 2 {
+		t.Fatalf("PreToolUse entries = %d, want 2 (core + ubs)", len(arr))
+	}
+	if got := innerCommand(t, arr[0].(map[string]any)); got != "gc hook --inject" {
+		t.Errorf("entry[0] inner command = %q, want gc hook --inject (core hook must be preserved)", got)
+	}
+	// Re-merge must stay at 2.
+	result2, err := MergeSettingsJSON(result, []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("second MergeSettingsJSON: %v", err)
+	}
+	if got := len(preToolUse(t, result2)); got != 2 {
+		t.Errorf("PreToolUse entries after re-merge = %d, want 2 (idempotent with core present)", got)
+	}
+}
+
+func TestMergeSettingsJSON_WrapBareHooks_BareOverlayDoesNotRewriteMatcherEntry(t *testing.T) {
+	// A wrapped base entry with a NON-empty matcher is a different hook, even
+	// when its inner command is identical to the bare overlay entry. The merge
+	// must append (coexist), never replace-and-rewrap (which would silently
+	// drop the "Bash" matcher).
+	base := `{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[` + ubsBareEntry + `]}]}}`
+	over := `{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	arr := preToolUse(t, result)
+	if len(arr) != 2 {
+		t.Fatalf("PreToolUse entries = %d, want 2 (distinct matchers coexist)", len(arr))
+	}
+	if got := arr[0].(map[string]any)["matcher"]; got != "Bash" {
+		t.Errorf("entry[0] matcher = %v, want Bash (matcher must not be rewritten)", got)
+	}
+}
+
+func TestMergeSettingsJSON_MergeCollapsesExactDuplicateBaseEntries(t *testing.T) {
+	// Healing for fleets already bloated by #3862: a base category carrying N
+	// byte-identical entries collapses to 1 on the next projection, instead of
+	// staying bloated until manual cleanup.
+	bloat := make([]string, 50)
+	for i := range bloat {
+		bloat[i] = `{"matcher":"","hooks":[` + ubsBareEntry + `]}`
+	}
+	base := `{"hooks":{"PreToolUse":[` + joinJSON(bloat) + `]}}`
+	over := `{"hooks":{"PreToolUse":[` + ubsBareEntry + `]}}`
+
+	result, err := MergeSettingsJSON([]byte(base), []byte(over), WithWrapBareHooks())
+	if err != nil {
+		t.Fatalf("MergeSettingsJSON: %v", err)
+	}
+	if got := len(preToolUse(t, result)); got != 1 {
+		t.Errorf("PreToolUse entries = %d, want 1 (exact duplicates collapsed)", got)
+	}
+}

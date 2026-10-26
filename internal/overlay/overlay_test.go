@@ -284,6 +284,43 @@ func TestCopyDir_MergesSettingsJSON(t *testing.T) {
 	}
 }
 
+// TestCopyDir_RepeatedStagingBareHookStaysSingleton reproduces
+// gastownhall/gascity#3862 at the filesystem layer: a pack overlay ships a
+// bare {type,command} PreToolUse entry, and the reconciler re-stages the
+// overlay into the live workdir on every tick. Repeated CopyDir runs must
+// converge to exactly one hook entry, not append one per tick.
+func TestCopyDir_RepeatedStagingBareHookStaysSingleton(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+
+	overJSON := `{"hooks": {"PreToolUse": [{"type": "command", "command": "if echo \"$TOOL_INPUT\" | grep -q 'git commit'; then ubs --staged --format=json 2>/dev/null || true; fi"}]}}`
+	writeFile(t, filepath.Join(src, ".claude", "settings.json"), overJSON)
+
+	for tick := 1; tick <= 3; tick++ {
+		var stderr bytes.Buffer
+		if err := CopyDir(src, dst, &stderr); err != nil {
+			t.Fatalf("CopyDir tick %d: %v", tick, err)
+		}
+		data, err := os.ReadFile(filepath.Join(dst, ".claude", "settings.json"))
+		if err != nil {
+			t.Fatalf("reading settings after tick %d: %v", tick, err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("unmarshal after tick %d: %v", tick, err)
+		}
+		arr := doc["hooks"].(map[string]any)["PreToolUse"].([]any)
+		if len(arr) != 1 {
+			t.Fatalf("PreToolUse entries after tick %d = %d, want 1 (idempotent re-projection):\n%s", tick, len(arr), data)
+		}
+		// The entry must be in the wrapped Claude shape.
+		entry := arr[0].(map[string]any)
+		if _, ok := entry["hooks"]; !ok {
+			t.Fatalf("entry after tick %d lacks wrapped shape: %v", tick, entry)
+		}
+	}
+}
+
 func TestCopyDir_NonMergeableOverwrite(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()

@@ -89,7 +89,16 @@ func WithWrapBareHooks() MergeOption {
 //     matcher/command) → identity is "inner:<canonical inner hooks>", so an
 //     overlay re-projecting an already-present command is a no-op instead of
 //     an unbounded append.
-//     5. else → no identity, always append
+//     5. shape fallback for matcherless overlay entries: a bare or
+//     matcherless-wrapper overlay entry whose effective inner hooks are
+//     canonically identical to a base entry with no/empty matcher replaces
+//     that base entry. This makes re-projecting a bare entry over its own
+//     wrapped projection a no-op instead of an unbounded append
+//     (gastownhall/gascity#3862).
+//     6. else → no identity, always append
+//   - Exact-duplicate base entries (byte-identical after canonicalization)
+//     are collapsed to a single copy, so settings files already bloated by
+//     repeated blind-appends heal on the next merge.
 //   - With WithWrapBareHooks, a final pass over the merged hooks normalizes any
 //     bare entry (one with neither a "matcher" nor a "hooks" key) into
 //     {"matcher": "", "hooks": [entry]}. This runs after the keyed merge so no
@@ -203,17 +212,50 @@ func mergeHooksMap(base, over map[string]any) map[string]any {
 // mergeHookArray merges two arrays of hook entries by identity key.
 // Entries with the same identity → overlay replaces base in-place.
 // New entries → appended.
+//
+// Base entries that are byte-identical after canonicalization are collapsed
+// to a single copy while indexing: an already-bloated settings file (the
+// damage from gastownhall/gascity#3862) heals on the next projection instead
+// of carrying thousands of duplicates forever.
 func mergeHookArray(base, over []any) []any {
-	// Build ordered result starting from base entries.
-	result := make([]any, len(base))
-	copy(result, base)
+	// Build ordered result starting from base entries, dropping exact
+	// duplicates (same canonical JSON) — they are pure redundancy.
+	result := make([]any, 0, len(base))
+	seenCanon := make(map[string]bool, len(base))
+	for _, entry := range base {
+		if m, ok := entry.(map[string]any); ok {
+			if canon, err := MarshalCanonicalJSON(m); err == nil {
+				key := string(bytes.TrimRight(canon, "\n"))
+				if seenCanon[key] {
+					continue
+				}
+				seenCanon[key] = true
+			}
+		}
+		result = append(result, entry)
+	}
 
 	// Index base entries by identity for in-place replacement.
-	baseIdx := make(map[string]int) // identity → index in result
+	baseIdx := make(map[string]int)  // identity → index in result
+	shapeIdx := make(map[string]int) // shape identity → first index in result
 	for i, entry := range result {
-		if m, ok := entry.(map[string]any); ok {
-			if key, hasKey := hookEntryKey(m); hasKey {
-				baseIdx[key] = i
+		m, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		if key, hasKey := hookEntryKey(m); hasKey {
+			baseIdx[key] = i
+		}
+		// Shape identity applies only to entries a matcherless overlay entry
+		// could be equivalent to: bare entries and wrappers with no or empty
+		// matcher. A wrapped entry with a non-empty matcher is a different
+		// hook even when its inner command is identical, so it stays
+		// matcher-keyed only.
+		if matcher, hasMatcher := m["matcher"]; !hasMatcher || matcher == "" {
+			if shapeKey, sok := hookShapeKey(m); sok {
+				if _, exists := shapeIdx[shapeKey]; !exists {
+					shapeIdx[shapeKey] = i
+				}
 			}
 		}
 	}
@@ -225,18 +267,40 @@ func mergeHookArray(base, over []any) []any {
 			continue
 		}
 		key, hasKey := hookEntryKey(m)
+		if hasKey {
+			if idx, found := baseIdx[key]; found {
+				// Same identity → replace in-place.
+				result[idx] = entry
+				continue
+			}
+		}
+		// Shape fallback for matcherless overlay entries: a bare
+		// {"type":"command","command":X} overlay re-projected over its own
+		// wrapped projection {"matcher":"","hooks":[<entry>]} (or a
+		// matcherless wrapper over an identical one) must replace it, not
+		// blind-append another copy on every reconcile tick (#3862).
+		if _, hasMatcher := m["matcher"]; !hasMatcher {
+			if shapeKey, sok := hookShapeKey(m); sok {
+				if idx, found := shapeIdx[shapeKey]; found {
+					result[idx] = entry
+					continue
+				}
+			}
+		}
 		if !hasKey {
 			// No identity → always append.
 			result = append(result, entry)
 			continue
 		}
-		if idx, found := baseIdx[key]; found {
-			// Same identity → replace in-place.
-			result[idx] = entry
-		} else {
-			// New identity → append.
-			result = append(result, entry)
-			baseIdx[key] = len(result) - 1
+		// New identity → append.
+		result = append(result, entry)
+		baseIdx[key] = len(result) - 1
+		if _, hasMatcher := m["matcher"]; !hasMatcher || m["matcher"] == "" {
+			if shapeKey, sok := hookShapeKey(m); sok {
+				if _, exists := shapeIdx[shapeKey]; !exists {
+					shapeIdx[shapeKey] = len(result) - 1
+				}
+			}
 		}
 	}
 	return result
@@ -294,6 +358,31 @@ func innerHooksKey(inner any) (string, bool) {
 		return "", false
 	}
 	return "inner:" + string(bytes.TrimRight(canon, "\n")), true
+}
+
+// hookShapeKey derives a shape-independent identity for a matcherless hook
+// entry: the canonical JSON of its effective inner hooks array. A bare entry
+// {"type":"command","command":X} and its wrapped projection
+// {"matcher":"","hooks":[<entry>]} produce the same key, so re-projecting a
+// bare overlay entry over the wrapped copy a previous projection wrote
+// replaces it instead of blind-appending (gastownhall/gascity#3862).
+// Returns false when the entry's "hooks" value is present but not a JSON
+// array.
+func hookShapeKey(entry map[string]any) (string, bool) {
+	inner, hasHooks := entry["hooks"]
+	if !hasHooks {
+		// Bare entry: its wrapped form nests the entry itself verbatim, so
+		// the effective inner array is the entry as a singleton.
+		inner = []any{entry}
+	}
+	if _, ok := inner.([]any); !ok {
+		return "", false
+	}
+	canon, err := MarshalCanonicalJSON(inner)
+	if err != nil {
+		return "", false
+	}
+	return "shape:" + string(bytes.TrimRight(canon, "\n")), true
 }
 
 // wrapBareHookEntries returns a copy of a hooks map in which every bare
