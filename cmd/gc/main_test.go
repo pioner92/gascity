@@ -6440,6 +6440,109 @@ prompt_template = "prompts/does-not-exist.md"
 	}
 }
 
+// TestDoPrimeStrictPromptTemplateParseError verifies --strict exits
+// non-zero when the agent's prompt_template fails to parse (e.g. an
+// undefined function like {{base_branch}}). Regression test for #8149:
+// previously prime printed the parse error to stderr, fell back to the
+// raw template text, and exited 0 even under --strict.
+func TestDoPrimeStrictPromptTemplateParseError(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	dir := t.TempDir()
+	gcDir := filepath.Join(dir, ".gc")
+	if err := os.MkdirAll(gcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	promptDir := filepath.Join(dir, "prompts")
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// {{base_branch}} is an undefined function: a parse error.
+	templateContent := "Mayor prompt for {{base_branch}}\n"
+	if err := os.WriteFile(filepath.Join(promptDir, "mayor.template.md"), []byte(templateContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code == 0 {
+		t.Fatalf("doPrimeWithMode(strict=true, template parse error) = 0, want non-zero; stderr: %s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("strict mode should not emit any prompt on template parse error, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "base_branch") {
+		t.Errorf("stderr = %q, want to mention the undefined function 'base_branch'", stderr.String())
+	}
+}
+
+// TestDoPrimeNonStrictPromptTemplateParseError pins the non-strict
+// contract from #8149: without --strict, a template parse error still
+// warns on stderr, falls back to the raw template text, and exits 0.
+func TestDoPrimeNonStrictPromptTemplateParseError(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+
+	dir := t.TempDir()
+	gcDir := filepath.Join(dir, ".gc")
+	if err := os.MkdirAll(gcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	promptDir := filepath.Join(dir, "prompts")
+	if err := os.MkdirAll(promptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	templateContent := "Mayor prompt for {{base_branch}}\n"
+	if err := os.WriteFile(filepath.Join(promptDir, "mayor.template.md"), []byte(templateContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(strict=false, template parse error) = %d, want 0 (graceful fallback); stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "{{base_branch}}") {
+		t.Errorf("stdout = %q, want raw template fallback containing '{{base_branch}}'", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "base_branch") {
+		t.Errorf("stderr = %q, want parse-error warning mentioning 'base_branch'", stderr.String())
+	}
+}
+
 func TestDoPrimeStrictAbsoluteTemplatePath(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)

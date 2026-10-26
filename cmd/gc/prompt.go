@@ -68,10 +68,18 @@ type PromptContext struct {
 // SHA-256 of the rendered text (after text/template substitution); two
 // runs with the same Version but diverging SHAs reveal an unbumped
 // template edit.
+//
+// RenderErr records a template parse/execute failure when the renderer
+// fell back to the raw template body. It is nil for the "file unreadable"
+// and "legitimately empty render" cases, which are supported minimal
+// configs rather than template mistakes. Callers running in a strict mode
+// (e.g. `gc prime --strict`) fail on a non-nil RenderErr instead of
+// silently accepting the fallback.
 type PromptRenderResult struct {
-	Text    string
-	Version string
-	SHA     string
+	Text      string
+	Version   string
+	SHA       string
+	RenderErr error
 }
 
 // renderPrompt reads a prompt template file and renders it with the given
@@ -172,9 +180,10 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
 	if err != nil {
 		fmt.Fprintf(stderr, "gc: prompt template %q: %v\n", templatePath, err) //nolint:errcheck // best-effort stderr
 		return PromptRenderResult{
-			Text:    body,
-			Version: fm.Version,
-			SHA:     promptmeta.SHA(body),
+			Text:      body,
+			Version:   fm.Version,
+			SHA:       promptmeta.SHA(body),
+			RenderErr: err,
 		}
 	}
 
@@ -183,9 +192,10 @@ func renderPromptWithMeta(fs fsys.FS, cityPath, cityName, templatePath string, c
 	if err := tmpl.Execute(&buf, td); err != nil {
 		fmt.Fprintf(stderr, "gc: prompt template %q: %v\n", templatePath, err) //nolint:errcheck // best-effort stderr
 		return PromptRenderResult{
-			Text:    body,
-			Version: fm.Version,
-			SHA:     promptmeta.SHA(body),
+			Text:      body,
+			Version:   fm.Version,
+			SHA:       promptmeta.SHA(body),
+			RenderErr: err,
 		}
 	}
 

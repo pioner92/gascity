@@ -84,6 +84,8 @@ back to the default prompt. Strict errors on:
   - no agent name given (from args, GC_ALIAS, or GC_AGENT)
   - agent name not in city config (typo detection — the main use case)
   - agent's prompt_template points at a file that cannot be read
+  - agent's prompt_template fails to parse or execute (e.g. an
+    undefined template function)
 
 Strict does NOT error on agents whose config intentionally lacks a
 prompt_template (a supported minimal config), on templates that render
@@ -114,7 +116,7 @@ to empty output from valid conditional logic, or on suspended states
 	}
 	cmd.Flags().BoolVar(&hookMode, "hook", false, "compatibility mode for runtime hook invocations")
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
-	cmd.Flags().BoolVar(&strictMode, "strict", false, "fail on missing city, missing or unknown agent, or unreadable prompt_template instead of falling back to the default prompt")
+	cmd.Flags().BoolVar(&strictMode, "strict", false, "fail on missing city, missing or unknown agent, or unreadable or invalid prompt_template instead of falling back to the default prompt")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON summary")
 	return cmd
 }
@@ -137,7 +139,8 @@ func doPrime(args []string, stdout, stderr io.Writer) int { //nolint:unparam // 
 
 // doPrimeWithMode's strict-mode contract: only states that would indicate
 // a user mistake (missing city config, no agent name, unknown agent name,
-// unreadable prompt_template file) error out. Supported minimal configs
+// unreadable prompt_template file, prompt_template parse/execute error)
+// error out. Supported minimal configs
 // (agent with no prompt_template at all, or a template that legitimately
 // renders to empty output via conditional logic) and intentional quiet
 // states (suspended city/agent) remain silent even under --strict —
@@ -274,6 +277,14 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 				fmt.Fprintf(stderr, "gc prime: prompt_template %q for agent %q: %v\n", a.PromptTemplate, agentName, fErr) //nolint:errcheck
 				return 1
 			}
+			// A readable template can still fail to parse or execute (e.g.
+			// an undefined function like {{base_branch}}). Non-strict prime
+			// warns and falls back to the raw text; under --strict that is
+			// exactly the debugging mistake strict exists to catch (#8149).
+			if rErr := renderStrictAgentPromptTemplate(cityPath, cityName, &a, cfg, stderr); rErr != nil {
+				fmt.Fprintf(stderr, "gc prime: prompt_template %q for agent %q: %v\n", a.PromptTemplate, agentName, rErr) //nolint:errcheck
+				return 1
+			}
 		}
 		// Strict preconditions passed; now it's safe to update provider resume metadata.
 		runHookSideEffects()
@@ -353,6 +364,30 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 	// the correct output even under --strict.
 	writePrimePromptWithFormat(stdout, cityName, agentName, defaultPrimePrompt, hookMode, hookFormat, suppressHookPrompt)
 	return 0
+}
+
+// renderStrictAgentPromptTemplate renders one resolved agent's
+// prompt_template exactly as the main prime loop would, so the --strict
+// precondition can fail fast on template parse/execute errors before any
+// hook side effects or the nudge poller start. It returns the render
+// error, or nil when the template renders cleanly — including a
+// legitimately empty render and plain .md prompts that skip template
+// execution, both supported config shapes.
+func renderStrictAgentPromptTemplate(cityPath, cityName string, a *config.Agent, cfg *config.City, stderr io.Writer) error {
+	ctx := buildPrimeContextForBeads(cityPath, cityName, a, cfg.Rigs, cfg.Beads, stderr)
+	ctx.ProviderKey, ctx.ProviderDisplayName = providerInfoForAgent(a, &cfg.Workspace, cfg.Providers)
+	ctx.InstructionsFile = instructionsFileForAgent(a, &cfg.Workspace, cfg.Providers)
+	fragments := effectivePromptFragments(
+		cfg.Workspace.GlobalFragments,
+		a.InjectFragments,
+		a.AppendFragments,
+		a.InheritedAppendFragments,
+		cfg.AgentDefaults.AppendFragments,
+	)
+	packDirs := cfg.PackDirsForRig(ctx.RigName)
+	res := renderPromptWithMeta(fsys.OSFS{}, cityPath, cityName, a.PromptTemplate, ctx, cfg.Workspace.SessionTemplate, stderr,
+		packDirs, fragments, nil)
+	return res.RenderErr
 }
 
 func primeAgentCandidates(agentName string, hookMode bool, cityPath string) []string {
