@@ -933,6 +933,39 @@ func TestCoreWorkerPromptsUseHookClaimProtocol(t *testing.T) {
 	}
 }
 
+// TestCoreWorkerPromptsEscalateToConfiguredRecipient pins that a blocked
+// worker mails the city's escalation recipient through the same
+// GC_ESCALATION_RECIPIENT that escalate.sh reads, with the reserved `human`
+// alias as the fallback, instead of hard-coding any one role name.
+func TestCoreWorkerPromptsEscalateToConfiguredRecipient(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatalf("filepath.Abs(repo root): %v", err)
+	}
+
+	const want = `gc mail send "${GC_ESCALATION_RECIPIENT:-human}" -s "BLOCKED: `
+	for _, rel := range []string{
+		"internal/bootstrap/packs/core/assets/prompts/pool-worker.md",
+		"internal/bootstrap/packs/core/assets/prompts/graph-worker.md",
+	} {
+		t.Run(rel, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(repoRoot, rel))
+			if err != nil {
+				t.Fatalf("ReadFile(%s): %v", rel, err)
+			}
+			text := string(data)
+			if !strings.Contains(text, want) {
+				t.Fatalf("%s missing escalation via %q", rel, want)
+			}
+			for _, hardcoded := range []string{"gc mail send human", "gc mail send mayor"} {
+				if strings.Contains(text, hardcoded) {
+					t.Fatalf("%s still escalates with hard-coded recipient %q", rel, hardcoded)
+				}
+			}
+		})
+	}
+}
+
 func TestMergeFragmentLists(t *testing.T) {
 	tests := []struct {
 		name    string
